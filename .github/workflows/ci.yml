@@ -8,10 +8,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is left out while the repo is private: hosted Mac runners are scarce and queue for a long time.
-        # Add macos-latest back when the repo goes public.
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: linux
+            runner: ubuntu-latest
+          - name: windows
+            runner: windows-latest
+          # GuusLab's own Mac. Hosted macOS runners queue for a long time on private repos.
+          - name: macos
+            runner: [self-hosted, macOS]
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
