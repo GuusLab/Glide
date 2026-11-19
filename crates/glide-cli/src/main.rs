@@ -1,8 +1,9 @@
 //! `glide` command line: send, receive, and reproducible benchmarks.
 
 use anyhow::{bail, Result};
-use glide::{Key, Options, Order, Report, Sender};
+use glide::{HandshakeFailed, Key, Options, Order, Report, Sender};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -11,15 +12,28 @@ use tokio::net::{TcpListener, TcpStream};
 const USAGE: &str = "\
 glide: fast, offline, multi-stream file transfer
 
-  glide send <file-or-folder> --listen <addr>[,<addr>...] --key <secret>
+  glide send <file-or-folder> --listen <addr>[,<addr>...] --key <secret> [--max-failures N]
   glide recv --connect <addr>[,<addr>...] --key <secret> [--out DIR] [--seed DIR,...] [--order small|seq]
   glide bench                 crypto + hashing throughput of this machine
   glide bench-net [--mb N] [--streams N]   full protocol over loopback TCP
+
+The secret can also come from the GLIDE_KEY environment variable, which keeps it out of the
+process list and the shell history. The sender stops after 20 failed handshakes (--max-failures):
+each one is a guess at the secret.
 
 test shaping (sender): --limit-mbs 60,25   --kill-after-mb 150,0";
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+/// The shared secret, from `--key` or `GLIDE_KEY`. There is no default: an empty secret would be
+/// a transfer anybody on the network can join.
+fn key(args: &[String]) -> Result<Key> {
+    let secret = arg(args, "--key").or_else(|| std::env::var("GLIDE_KEY").ok()).unwrap_or_default();
+    if secret.is_empty() {
+        bail!("no secret: pass --key <secret> or set GLIDE_KEY");
+    }
+    Ok(Key::from_secret(&secret))
 }
 fn nth(spec: &Option<String>, i: usize) -> Option<f64> {
     spec.as_ref()?.split(',').nth(i)?.trim().parse().ok().filter(|v: &f64| *v > 0.0)
@@ -89,7 +103,11 @@ async fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("send") => {
             let path = PathBuf::from(args.get(2).cloned().unwrap_or_default());
-            let key = Key::from_secret(&arg(&args, "--key").unwrap_or_default());
+            let key = key(&args)?;
+            // Every failed handshake is one guess at the secret, and a short PIN does not survive
+            // many. So they are counted across all listeners, and the sender stops at the limit.
+            let max_failures: u32 = arg(&args, "--max-failures").and_then(|v| v.parse().ok()).unwrap_or(20);
+            let failures = Arc::new(AtomicU32::new(0));
             let (limits, kills) = (arg(&args, "--limit-mbs"), arg(&args, "--kill-after-mb"));
             let t = Instant::now();
             let sender = Sender::new(&path)?;
@@ -106,12 +124,13 @@ async fn main() -> Result<()> {
                 let l = TcpListener::bind(addr.trim()).await?;
                 let (sender, key, lim, kill) =
                     (sender.clone(), key.clone(), nth(&limits, i), nth(&kills, i).map(|v| (v * 1e6) as u64));
+                let failures = failures.clone();
                 eprintln!("stream {i}: listening on {addr}");
                 handles.push(tokio::spawn(async move {
                     loop {
                         let Ok((sock, peer)) = l.accept().await else { continue };
                         sock.set_nodelay(true).ok();
-                        let (sender, key) = (sender.clone(), key.clone());
+                        let (sender, key, failures) = (sender.clone(), key.clone(), failures.clone());
                         tokio::spawn(async move {
                             let r = if lim.is_some() || kill.is_some() {
                                 sender.serve(shaped(sock, lim, kill), &key).await
@@ -120,7 +139,15 @@ async fn main() -> Result<()> {
                             };
                             match r {
                                 Ok(b) => eprintln!("stream {i}: {peer} done, {:.1} MB sent", mb(b)),
-                                Err(e) => eprintln!("stream {i}: {peer} ended: {e}"),
+                                Err(e) => {
+                                    eprintln!("stream {i}: {peer} ended: {e}");
+                                    if e.downcast_ref::<HandshakeFailed>().is_some()
+                                        && failures.fetch_add(1, Ordering::SeqCst) + 1 >= max_failures
+                                    {
+                                        eprintln!("stopping: {max_failures} failed handshakes, somebody may be guessing the secret. Start again with a new one.");
+                                        std::process::exit(2);
+                                    }
+                                }
                             }
                         });
                     }
@@ -131,7 +158,7 @@ async fn main() -> Result<()> {
             std::future::pending::<()>().await;
         }
         Some("recv") => {
-            let key = Key::from_secret(&arg(&args, "--key").unwrap_or_default());
+            let key = key(&args)?;
             let mut streams = Vec::new();
             for a in arg(&args, "--connect").unwrap_or("127.0.0.1:7001".into()).split(',') {
                 let s = TcpStream::connect(a.trim()).await?;

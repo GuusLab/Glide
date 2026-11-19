@@ -17,11 +17,14 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Wire: Noise NNpsk0 handshake per stream, then 16-byte framed messages. Control frames are
-//! Noise-encrypted; data blocks are sealed with AES-256-GCM (both sides have hardware AES) or
-//! ChaCha20-Poly1305, keyed from the handshake hash. Files are cut with FastCDC (64 KiB to
+//! Wire: SPAKE2 on the shared secret, then a Noise NNpsk0 handshake keyed with its result, per
+//! stream, then 16-byte framed messages. Control frames are Noise-encrypted; data blocks are
+//! sealed with AES-256-GCM (both sides have hardware AES) or ChaCha20-Poly1305, keyed from the
+//! handshake hash. Files are cut with FastCDC (64 KiB to
 //! 1 MiB, 256 KiB average) and every unique block is BLAKE3-addressed. The receiver pulls:
 //! each stream keeps 32 blocks in flight, so faster streams simply ask more often.
+
+#![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Result};
 use glide_core::*;
@@ -30,14 +33,33 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use zeroize::Zeroize;
+
 pub use glide_core;
 
 const NOISE: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+/// The protocol version, bound into every handshake as the Noise prologue. Two sides that disagree
+/// about it fail the handshake cleanly instead of misreading each other's frames.
+const PROLOGUE: &[u8] = b"glide/0.4";
+/// A peer that connects and then says nothing is dropped after this long, so a listener cannot be
+/// held open by connections that never finish the handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upper bound on one control message (the manifest is the only large one). The bytes are
+/// decrypted piece by piece as they arrive, so memory only ever grows with authenticated data.
+const MAX_CONTROL: usize = 1 << 30;
+/// Blocks a receiver may have requested and not yet been sent, per stream. An honest receiver
+/// never exceeds `WINDOW`; the sender refuses a peer that queues more than this.
+const MAX_PENDING: usize = WINDOW * 2;
+/// A block that fails verification this many times ends the transfer. Without the limit a sender
+/// whose file changed under it (or a hostile one) would be asked for the same block forever.
+const MAX_BLOCK_FAILURES: u8 = 3;
+/// Longest relative path a manifest may carry.
+const MAX_PATH: usize = 4096;
 /// Blocks in flight per stream.
 pub const WINDOW: usize = 32;
 const CDC_MIN: u32 = 64 * 1024;
@@ -94,8 +116,13 @@ impl At for File {
 
 // ================================================================== public API
 
-/// The 32-byte pre-shared key. Derive it from whatever both sides know: the secret inside the
-/// on-screen code, or a short PIN typed on one device.
+/// The shared secret, hashed to 32 bytes. Derive it from whatever both sides know: the secret
+/// inside the on-screen code, or a short PIN typed on one device.
+///
+/// It is never used as a key directly. Each stream runs SPAKE2 on it first, so somebody who
+/// records or intercepts a handshake gets no way to test guesses offline: every guess at a short
+/// PIN costs one live connection, which the application can count and cut off. The bytes are
+/// wiped when the key is dropped, and the type has no `Debug` on purpose.
 #[derive(Clone)]
 pub struct Key(pub [u8; 32]);
 impl Key {
@@ -103,6 +130,23 @@ impl Key {
         Key(blake3::derive_key("nemi glide 2026 psk v1", secret.as_bytes()))
     }
 }
+impl Drop for Key {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// The handshake did not complete: the other side has a different secret, speaks another protocol
+/// version, sent garbage, or went quiet. Deliberately one error for all of them, so a peer learns
+/// nothing from which one it was. A listener should count these: each is one guess at the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeFailed;
+impl std::fmt::Display for HandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("handshake failed: wrong key, or the other side speaks another version")
+    }
+}
+impl std::error::Error for HandshakeFailed {}
 
 /// The sending side: scans and chunks a file or folder once, then serves any number of streams.
 #[derive(Clone)]
@@ -234,26 +278,65 @@ enum Frame {
 }
 
 impl Link {
+    /// Every way the handshake can go wrong is reported as the same `HandshakeFailed`.
     async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         stream: S,
         key: &Key,
         initiator: bool,
     ) -> Result<Link> {
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::handshake_inner(stream, key, initiator)).await {
+            Ok(Ok(link)) => Ok(link),
+            _ => Err(HandshakeFailed.into()),
+        }
+    }
+    async fn handshake_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        stream: S,
+        key: &Key,
+        initiator: bool,
+    ) -> Result<Link> {
+        use spake2::{Ed25519Group, Identity, Password, Spake2};
         let (r, w) = tokio::io::split(stream);
         let mut rd: Rd = BufReader::with_capacity(1 << 20, Box::new(r));
         let mut wr: Wr = Box::new(w);
-        let b = snow::Builder::new(NOISE.parse()?).psk(0, &key.0);
-        let mut hs = if initiator { b.build_initiator()? } else { b.build_responder()? };
+
+        // Step 1, SPAKE2. The secret may be a six-digit PIN, and a PIN used as a pre-shared key
+        // directly can be found offline from one recorded handshake (try all million, compare the
+        // tag). SPAKE2 turns it into a strong per-stream key without ever exposing anything a
+        // guess can be tested against, so the only attack left is one online guess per connection.
+        let (ida, idb) = (Identity::new(b"glide receiver"), Identity::new(b"glide sender"));
+        let pw = Password::new(key.0);
+        let (pake, mine) = if initiator {
+            Spake2::<Ed25519Group>::start_a(&pw, &ida, &idb)
+        } else {
+            Spake2::<Ed25519Group>::start_b(&pw, &ida, &idb)
+        };
+        put16(&mut wr, &mine).await?;
+        let theirs = get16(&mut rd, 64).await?;
+        let mut shared = pake.finish(&theirs).map_err(|_| anyhow!("pake"))?;
+        let mut psk = blake3::derive_key("nemi glide 2026 psk v2", &shared);
+        shared.zeroize();
+
+        // Step 2, Noise NNpsk0 keyed with the SPAKE2 result. Its first message is the key
+        // confirmation: a responder whose secret differs cannot read it.
+        let built = {
+            let b = snow::Builder::new(NOISE.parse()?).prologue(PROLOGUE).psk(0, &psk);
+            if initiator {
+                b.build_initiator()
+            } else {
+                b.build_responder()
+            }
+        };
+        psk.zeroize();
+        let mut hs = built?;
         let mut buf = [0u8; 256];
-        let wrong = |_| anyhow!("handshake failed: wrong key");
         if initiator {
             let n = hs.write_message(&[], &mut buf)?;
             put16(&mut wr, &buf[..n]).await?;
-            let m = get16(&mut rd).await?;
-            hs.read_message(&m, &mut buf).map_err(wrong)?;
+            let m = get16(&mut rd, 128).await?;
+            hs.read_message(&m, &mut buf)?;
         } else {
-            let m = get16(&mut rd).await?;
-            hs.read_message(&m, &mut buf).map_err(wrong)?;
+            let m = get16(&mut rd, 128).await?;
+            hs.read_message(&m, &mut buf)?;
             let n = hs.write_message(&[], &mut buf)?;
             put16(&mut wr, &buf[..n]).await?;
         }
@@ -269,6 +352,9 @@ impl Link {
             payload.extend_from_slice(&(n as u16).to_be_bytes());
             payload.extend_from_slice(&out[..n]);
         }
+        if payload.len() > MAX_CONTROL {
+            bail!("control message too large");
+        }
         self.wr.write_all(&control_header(payload.len() as u32)).await?;
         self.wr.write_all(&payload).await?;
         self.wr.flush().await?;
@@ -277,39 +363,52 @@ impl Link {
     async fn recv(&mut self) -> Result<Frame> {
         read_frame(&mut self.rd, &mut self.noise).await
     }
-    fn data_key(&self, suite: u8) -> DataKey {
-        derive_data_key(
-            if suite == Suite::Aes256Gcm as u8 { Suite::Aes256Gcm } else { Suite::ChaCha20Poly1305 },
-            &self.hh,
-            "s2r",
-        )
+    fn data_key(&self, suite: u8) -> Result<DataKey> {
+        let suite = Suite::from_wire(suite).ok_or_else(|| anyhow!("unknown cipher suite"))?;
+        Ok(derive_data_key(suite, &self.hh, "s2r"))
     }
 }
 async fn read_frame(rd: &mut Rd, noise: &mut snow::TransportState) -> Result<Frame> {
     let mut h = [0u8; HDR];
     rd.read_exact(&mut h).await?;
     let hd = parse_header(&h);
-    if hd.len as usize > MAX_BLOCK + 65536 {
-        bail!("frame too large");
-    }
-    let mut payload = vec![0u8; hd.len as usize];
-    rd.read_exact(&mut payload).await?;
+    let len = hd.len as usize;
     match hd.kind {
+        // Nothing in a header is authenticated yet, so the length it claims is never used to
+        // allocate. A control message is read and decrypted one Noise piece (at most 64 KiB) at a
+        // time: a forged length costs the forger a failed decrypt, not our memory.
         T_CONTROL => {
-            let (mut plain, mut out, mut i) = (Vec::new(), vec![0u8; 65535], 0);
-            while i + 2 <= payload.len() {
-                let n = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-                i += 2;
-                if i + n > payload.len() {
+            if len > MAX_CONTROL {
+                bail!("frame too large");
+            }
+            let (mut plain, mut piece, mut out, mut left) = (Vec::new(), vec![0u8; 65535], vec![0u8; 65535], len);
+            while left > 0 {
+                if left < 2 {
                     bail!("bad control frame");
                 }
-                let k = noise.read_message(&payload[i..i + n], &mut out).map_err(|_| anyhow!("decrypt failed"))?;
+                let mut l = [0u8; 2];
+                rd.read_exact(&mut l).await?;
+                let n = u16::from_be_bytes(l) as usize;
+                left -= 2;
+                if n < 16 || n > left {
+                    bail!("bad control frame");
+                }
+                rd.read_exact(&mut piece[..n]).await?;
+                left -= n;
+                let k = noise.read_message(&piece[..n], &mut out).map_err(|_| anyhow!("decrypt failed"))?;
                 plain.extend_from_slice(&out[..k]);
-                i += n;
             }
             Ok(Frame::Msg(bincode::deserialize(&plain)?))
         }
-        T_DATA => Ok(Frame::Data { flags: hd.flags, id: hd.id, plain_len: hd.plain_len, sealed: payload }),
+        // A sealed block is at most one block plus its tag: compression is only kept when it wins.
+        T_DATA => {
+            if !(16..=MAX_BLOCK + 16).contains(&len) || hd.plain_len as usize > MAX_BLOCK || hd.flags & !F_KNOWN != 0 {
+                bail!("bad data frame");
+            }
+            let mut payload = vec![0u8; len];
+            rd.read_exact(&mut payload).await?;
+            Ok(Frame::Data { flags: hd.flags, id: hd.id, plain_len: hd.plain_len, sealed: payload })
+        }
         _ => bail!("unknown frame"),
     }
 }
@@ -319,10 +418,14 @@ async fn put16(w: &mut Wr, b: &[u8]) -> Result<()> {
     w.flush().await?;
     Ok(())
 }
-async fn get16(r: &mut Rd) -> Result<Vec<u8>> {
+async fn get16(r: &mut Rd, max: usize) -> Result<Vec<u8>> {
     let mut l = [0u8; 2];
     r.read_exact(&mut l).await?;
-    let mut b = vec![0u8; u16::from_be_bytes(l) as usize];
+    let n = u16::from_be_bytes(l) as usize;
+    if n > max {
+        bail!("handshake message too large");
+    }
+    let mut b = vec![0u8; n];
     r.read_exact(&mut b).await?;
     Ok(b)
 }
@@ -394,13 +497,18 @@ fn chunk_file(path: &Path) -> Result<Vec<(u64, u32, [u8; 32])>> {
 }
 fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
     for e in std::fs::read_dir(dir)? {
-        let p = e?.path();
+        let e = e?;
+        let p = e.path();
         if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".glide-")) {
             continue;
         }
-        if p.is_dir() {
+        // The entry's own type, not what it points at. A symlink is never followed: one that
+        // leaves the folder would send files the person never chose to share, and one that points
+        // back up would walk forever.
+        let t = e.file_type()?;
+        if t.is_dir() {
             walk(base, &p, out)?;
-        } else if p.is_file() {
+        } else if t.is_file() {
             out.push((p.clone(), p.strip_prefix(base)?.to_string_lossy().replace('\\', "/")));
         }
     }
@@ -417,6 +525,137 @@ fn list(root: &Path) -> Result<Vec<(PathBuf, String)>> {
         bail!("{} not found", root.display());
     }
     Ok(l)
+}
+
+// ================================================================== manifest checks
+
+/// The session id names the resume state, so it has to cover everything a block's content depends
+/// on: the hashes too, not only the layout. Two versions of a file that happen to cut at the same
+/// offsets would otherwise share one resume state, and the second transfer would keep blocks of
+/// the first. The receiver computes this itself and never takes the sender's word for it.
+fn session_id(files: &[FileEntry], chunks: &[Occ], blocks: &[[u8; 32]], block_len: &[u32]) -> Result<[u8; 16]> {
+    let mut h = blake3::Hasher::new_derive_key("nemi glide 2026 session v2");
+    h.update(&bincode::serialize(&(files, chunks, blocks, block_len))?);
+    let mut session = [0u8; 16];
+    session.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    Ok(session)
+}
+
+#[cfg(windows)]
+fn hostile_here(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    device || c.ends_with('.') || c.ends_with(' ') || c.chars().any(|ch| "<>:\"|?*".contains(ch))
+}
+#[cfg(not(windows))]
+fn hostile_here(_: &str) -> bool {
+    false
+}
+
+/// Turn a path from a manifest into one that is certain to stay inside the output folder.
+/// The sender chose these bytes, so nothing about them is trusted: no absolute paths, no `..`,
+/// no empty or `.` components, no backslashes (a separator on Windows), no control characters,
+/// and nothing that would collide with Glide's own `.glide-` bookkeeping files.
+fn safe_path(path: &str) -> Result<PathBuf> {
+    let refuse = || anyhow!("unsafe path in manifest: {path:?}");
+    if path.is_empty() || path.len() > MAX_PATH {
+        return Err(refuse());
+    }
+    let mut p = PathBuf::new();
+    for c in path.split('/') {
+        if c.is_empty()
+            || c == "."
+            || c == ".."
+            || c.starts_with(".glide-")
+            || c.chars().any(|ch| ch.is_control() || ch == '\\')
+            || hostile_here(c)
+        {
+            return Err(refuse());
+        }
+        p.push(c);
+    }
+    Ok(p)
+}
+
+/// Check everything a manifest claims before a single byte of it is acted on, and return the
+/// output path of every file. A manifest comes from the other side: every index in it is used to
+/// index memory and every offset to position a write, so each one is proven in range here, once,
+/// rather than trusted at the place it is used.
+fn validate(m: &Manifest) -> Result<Vec<PathBuf>> {
+    let bad = |what: &str| anyhow!("invalid manifest: {what}");
+    let n = m.blocks.len();
+    if n != m.block_len.len() || n > u32::MAX as usize || m.chunks.len() > u32::MAX as usize {
+        return Err(bad("block tables do not match"));
+    }
+    if m.block_len.iter().any(|l| *l == 0 || *l as usize > MAX_BLOCK) {
+        return Err(bad("block size out of range"));
+    }
+    if m.session != session_id(&m.files, &m.chunks, &m.blocks, &m.block_len)? {
+        return Err(bad("session id does not match the content"));
+    }
+    let (mut paths, mut seen) = (Vec::with_capacity(m.files.len()), HashSet::new());
+    let (mut next, mut total) = (0usize, 0u64);
+    for (fi, f) in m.files.iter().enumerate() {
+        let p = safe_path(&f.path)?;
+        if !seen.insert(p.clone()) {
+            return Err(bad("the same path twice"));
+        }
+        paths.push(p);
+        // A file's chunks are one contiguous run of the chunk list, in order, and tile the file
+        // exactly: no gap, no overlap, nothing past the end.
+        let end = next.checked_add(f.count as usize).filter(|e| *e <= m.chunks.len());
+        let Some(end) = end.filter(|_| f.first as usize == next) else {
+            return Err(bad("file chunk range out of bounds"));
+        };
+        let mut off = 0u64;
+        for o in &m.chunks[next..end] {
+            let known = m.block_len.get(o.block as usize);
+            if o.file as usize != fi || o.off != off || known != Some(&o.len) {
+                return Err(bad("chunk does not fit its file"));
+            }
+            off += o.len as u64;
+        }
+        if off != f.size {
+            return Err(bad("chunks do not add up to the file size"));
+        }
+        next = end;
+        total = total.checked_add(f.size).ok_or_else(|| bad("total size overflows"))?;
+    }
+    if next != m.chunks.len() || total != m.total {
+        return Err(bad("totals do not match"));
+    }
+    Ok(paths)
+}
+
+/// The place a file goes, reached without following a single symlink. Every folder on the way
+/// must be a real folder (created here if missing) and the file itself a regular file or absent.
+/// A link planted in the output folder would otherwise redirect a write to wherever it points.
+fn dest_path(out: &Path, rel: &Path, create: bool) -> Result<PathBuf> {
+    let refuse = |p: &Path| anyhow!("refusing to write through {}: not a plain file or folder", p.display());
+    let mut p = out.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(c) = parts.next() {
+        p.push(c);
+        let last = parts.peek().is_none();
+        match std::fs::symlink_metadata(&p) {
+            Ok(md) if last && md.file_type().is_file() => {}
+            Ok(md) if !last && md.file_type().is_dir() => {}
+            Ok(_) => return Err(refuse(&p)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !last && create {
+                    std::fs::create_dir(&p)?;
+                } else if !last {
+                    // Nothing below a missing folder can exist yet, so there is nothing to check.
+                    return Ok(out.join(rel));
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(p)
 }
 
 // ================================================================== sender
@@ -455,10 +694,7 @@ impl Source {
             files.push(File::open(p)?);
             total += size;
         }
-        let mut h = blake3::Hasher::new();
-        h.update(&bincode::serialize(&(&fes, &chunks))?);
-        let mut session = [0u8; 16];
-        session.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        let session = session_id(&fes, &chunks, &blocks, &block_len)?;
         let raw = (0..fes.len()).map(|_| AtomicBool::new(false)).collect();
         Ok(Source { manifest: Manifest { session, files: fes, chunks, blocks, block_len, total }, files, first, raw })
     }
@@ -496,13 +732,20 @@ async fn serve_link(mut l: Link, src: Arc<Source>) -> Result<u64> {
     if want {
         l.send_msg(&Msg::Manifest(src.manifest.clone())).await?;
     }
-    let key = Arc::new(l.data_key(suite));
+    let key = Arc::new(l.data_key(suite)?);
     let Link { mut rd, mut wr, mut noise, .. } = l;
     let (tx, mut ready) = tokio::sync::mpsc::unbounded_channel::<Result<(u32, u8, u32, Vec<u8>)>>();
+    // Blocks requested and not yet written. A receiver that asks faster than it reads would
+    // otherwise have the sender read, compress and queue the whole transfer in memory.
+    let pending = Arc::new(AtomicUsize::new(0));
+    let queued = pending.clone();
     let reader = tokio::spawn(async move {
         loop {
             match read_frame(&mut rd, &mut noise).await? {
                 Frame::Msg(Msg::Request { ids }) => {
+                    if queued.fetch_add(ids.len(), Ordering::SeqCst) + ids.len() > MAX_PENDING {
+                        bail!("receiver requested more blocks than it reads");
+                    }
                     for id in ids {
                         let (s, k, tx) = (src.clone(), key.clone(), tx.clone());
                         rayon::spawn(move || {
@@ -520,6 +763,7 @@ async fn serve_link(mut l: Link, src: Arc<Source>) -> Result<u64> {
         let (id, f, n, b) = r?;
         wr.write_all(&data_header(f, id, n, b.len() as u32)).await?;
         wr.write_all(&b).await?;
+        pending.fetch_sub(1, Ordering::SeqCst);
         sent += b.len() as u64;
         if ready.is_empty() {
             wr.flush().await?;
@@ -543,6 +787,9 @@ struct Sched {
     done_bytes: u64,
     state: PathBuf,
     dirty: usize,
+    fails: HashMap<u32, u8>,
+    /// Set when a block has failed verification too often; every stream stops on it.
+    fatal: bool,
 }
 impl Sched {
     fn done(&self) -> bool {
@@ -584,6 +831,11 @@ impl Sched {
     fn finish(&mut self, s: usize, id: u32, ok: bool, len: usize, wire: usize) {
         self.processing.remove(&id);
         if !ok {
+            let f = self.fails.entry(id).or_insert(0);
+            *f += 1;
+            if *f >= MAX_BLOCK_FAILURES {
+                self.fatal = true;
+            }
             self.pool.push(id);
             return;
         }
@@ -638,7 +890,13 @@ struct Prepared {
 /// Lay out the output folder. Old versions of incoming files are moved aside and, with any extra
 /// seeds, chunked: every block found there is copied locally instead of crossing a stream.
 fn prepare(m: &Manifest, out: &Path, opts: &Options, streams: usize) -> Result<Prepared> {
+    // Nothing on disk is touched until the whole manifest has been proven sane and every
+    // destination has been proven to be a plain path inside the output folder.
+    let rels = validate(m)?;
     std::fs::create_dir_all(out)?;
+    for rel in &rels {
+        dest_path(out, rel, false)?;
+    }
     let n = m.blocks.len();
     let state = out.join(format!(".glide-{}", m.session.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let mut have = vec![false; n];
@@ -654,9 +912,9 @@ fn prepare(m: &Manifest, out: &Path, opts: &Options, streams: usize) -> Result<P
     let mut seeds: Vec<PathBuf> = Vec::new();
     let mut moved = Vec::new();
     if !resuming {
-        for f in &m.files {
-            let p = out.join(&f.path);
-            if p.is_file() {
+        for rel in &rels {
+            let p = out.join(rel);
+            if std::fs::symlink_metadata(&p).is_ok_and(|md| md.file_type().is_file()) {
                 let aside =
                     p.with_file_name(format!(".glide-old-{}", p.file_name().unwrap_or_default().to_string_lossy()));
                 std::fs::rename(&p, &aside)?;
@@ -669,11 +927,8 @@ fn prepare(m: &Manifest, out: &Path, opts: &Options, streams: usize) -> Result<P
         seeds.extend(list(s)?.into_iter().map(|x| x.0));
     }
     let mut files = Vec::new();
-    for f in &m.files {
-        let p = out.join(&f.path);
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)?;
-        }
+    for (f, rel) in m.files.iter().zip(&rels) {
+        let p = dest_path(out, rel, true)?;
         let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&p)?;
         if file.metadata()?.len() != f.size {
             file.set_len(f.size)?;
@@ -685,6 +940,25 @@ fn prepare(m: &Manifest, out: &Path, opts: &Options, streams: usize) -> Result<P
         places[o.block as usize].push((o.file, o.off));
     }
     let dest = Dest { files, places };
+    // The resume state is a claim, not a fact: it is written before the data it describes is
+    // known to be on disk, and the files may have been edited, truncated or replaced since. So
+    // every block it says we have is read back and hashed, in every place it sits, and a block
+    // that is not there in full is simply fetched again.
+    if resuming {
+        let stale: Vec<u32> = m
+            .chunks
+            .par_iter()
+            .filter(|o| have[o.block as usize])
+            .filter_map(|o| {
+                let mut buf = vec![0u8; o.len as usize];
+                let read = dest.files[o.file as usize].read_exact_at(&mut buf, o.off);
+                (read.is_err() || blake3::hash(&buf).as_bytes() != &m.blocks[o.block as usize]).then_some(o.block)
+            })
+            .collect();
+        for b in stale {
+            have[b as usize] = false;
+        }
+    }
     let mut reused = 0u64;
     let wanted: HashMap<[u8; 32], u32> =
         m.blocks.iter().enumerate().filter(|(i, _)| !have[*i]).map(|(i, h)| (*h, i as u32)).collect();
@@ -739,6 +1013,8 @@ fn prepare(m: &Manifest, out: &Path, opts: &Options, streams: usize) -> Result<P
         done_bytes,
         state,
         dirty: 0,
+        fails: HashMap::new(),
+        fatal: false,
     };
     Ok(Prepared { sched, dest, moved, reused })
 }
@@ -801,11 +1077,14 @@ async fn receive_links(mut links: Vec<Link>, out: PathBuf, opts: Options) -> Res
                         _ => bail!("expected accept"),
                     }
                 };
-                let key = Arc::new(l.data_key(suite));
+                let key = Arc::new(l.data_key(suite)?);
                 let mut outstanding = 0;
                 loop {
                     let ids: Vec<u32> = {
                         let mut g = sched.lock().unwrap();
+                        if g.fatal {
+                            bail!("a block failed verification {MAX_BLOCK_FAILURES} times");
+                        }
                         (outstanding..WINDOW).filter_map(|_| g.take(s)).collect()
                     };
                     outstanding += ids.len();
@@ -878,4 +1157,257 @@ async fn receive_links(mut links: Vec<Link>, out: PathBuf, opts: Options) -> Res
         per_stream: g.per_stream.clone(),
         elapsed: t0.elapsed(),
     })
+}
+
+// ================================================================== tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("glide-unit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn source(d: &Path) -> Source {
+        std::fs::create_dir_all(d.join("src/sub")).unwrap();
+        std::fs::write(d.join("src/a.bin"), vec![7u8; 300_000]).unwrap();
+        std::fs::write(d.join("src/sub/b.txt"), b"hello").unwrap();
+        std::fs::write(d.join("src/empty"), b"").unwrap();
+        Source::build(&d.join("src")).unwrap()
+    }
+    /// Re-seal a tampered manifest the way a hostile sender would, so only the check under test
+    /// can refuse it.
+    fn resealed(mut m: Manifest) -> Manifest {
+        m.session = session_id(&m.files, &m.chunks, &m.blocks, &m.block_len).unwrap();
+        m
+    }
+
+    #[test]
+    fn paths_that_leave_the_folder_are_refused() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a//b",
+            "a/./b",
+            "a/",
+            "..",
+            "a\\b",
+            "a\u{0}b",
+            "a\nb",
+            ".glide-old-x",
+            "a/.glide-0011",
+        ] {
+            assert!(safe_path(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(safe_path(&"a/".repeat(3000)).is_err());
+        for good in ["a", "a/b/c.txt", ".hidden", "a..b", "...", "name with spaces.txt", "ünï/cødé"] {
+            assert_eq!(safe_path(good).unwrap(), PathBuf::from(good));
+        }
+    }
+
+    #[test]
+    fn an_honest_manifest_passes() {
+        let d = tmp("honest");
+        let paths = validate(&source(&d).manifest).unwrap();
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn every_lie_in_a_manifest_is_caught() {
+        let d = tmp("lies");
+        let m = source(&d).manifest;
+        let big = m.files.iter().position(|f| f.count > 0).unwrap();
+        let ci = m.files[big].first as usize;
+        type Lie = Box<dyn Fn(&mut Manifest)>;
+        let lies: Vec<(&str, Lie)> = vec![
+            ("path escapes", Box::new(move |m| m.files[big].path = "../../escape".into())),
+            ("absolute path", Box::new(move |m| m.files[big].path = "/tmp/escape".into())),
+            ("duplicate path", Box::new(|m| m.files[1].path = m.files[0].path.clone())),
+            ("block index out of range", Box::new(move |m| m.chunks[ci].block = u32::MAX)),
+            ("file index out of range", Box::new(move |m| m.chunks[ci].file = 99)),
+            ("offset past the file", Box::new(move |m| m.chunks[ci].off = 1 << 40)),
+            ("chunk length differs from block", Box::new(move |m| m.chunks[ci].len += 1)),
+            ("chunk range overflows", Box::new(move |m| m.files[big].count = u32::MAX)),
+            ("chunk range starts elsewhere", Box::new(move |m| m.files[big].first += 1)),
+            ("size larger than chunks", Box::new(move |m| m.files[big].size += 1)),
+            (
+                "huge size on an empty file",
+                Box::new(|m| m.files.iter_mut().find(|f| f.count == 0).unwrap().size = 1 << 62),
+            ),
+            ("oversized block", Box::new(|m| m.block_len[0] = MAX_BLOCK as u32 + 1)),
+            ("zero block", Box::new(|m| m.block_len[0] = 0)),
+            ("tables differ", Box::new(|m| m.block_len.push(1))),
+            ("wrong total", Box::new(|m| m.total += 1)),
+            ("stray chunk", Box::new(|m| m.chunks.push(m.chunks[0]))),
+        ];
+        for (what, lie) in lies {
+            let mut bad = m.clone();
+            lie(&mut bad);
+            assert!(validate(&resealed(bad)).is_err(), "not caught: {what}");
+        }
+        let mut stale = m.clone();
+        stale.blocks[0][0] ^= 1;
+        assert!(validate(&stale).is_err(), "a session id that does not cover the hashes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_output_folder_is_never_written_through() {
+        let d = tmp("links");
+        let (out, outside) = (d.join("out"), d.join("outside"));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, out.join("dir")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), out.join("file")).unwrap();
+        for create in [false, true] {
+            assert!(dest_path(&out, Path::new("dir/new.txt"), create).is_err());
+            assert!(dest_path(&out, Path::new("file"), create).is_err());
+        }
+        assert_eq!(dest_path(&out, Path::new("a/b/c.txt"), true).unwrap(), out.join("a/b/c.txt"));
+        assert!(out.join("a/b").is_dir());
+        assert!(!outside.join("new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sender_does_not_follow_symlinks() {
+        let d = tmp("walk");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("private")).unwrap();
+        std::fs::write(d.join("private/secret"), b"not shared").unwrap();
+        std::fs::write(d.join("src/shared"), b"shared").unwrap();
+        std::os::unix::fs::symlink(d.join("private"), d.join("src/link")).unwrap();
+        std::os::unix::fs::symlink(d.join("private/secret"), d.join("src/file-link")).unwrap();
+        std::os::unix::fs::symlink(d.join("src"), d.join("src/loop")).unwrap();
+        let names: Vec<String> = list(&d.join("src")).unwrap().into_iter().map(|x| x.1).collect();
+        assert_eq!(names, ["shared"]);
+    }
+
+    /// A sender that holds the right key and lies in its manifest: the receive fails and nothing
+    /// is written outside the output folder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hostile_sender_cannot_write_outside_the_output_folder() {
+        let d = tmp("hostile");
+        let mut src = source(&d);
+        let i = src.manifest.files.iter().position(|f| f.count > 0).unwrap();
+        src.manifest.files[i].path = "../escaped.bin".into();
+        src.manifest = resealed(src.manifest);
+        let key = Key::from_secret("123456");
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (src, k) = (Arc::new(src), key.clone());
+        tokio::spawn(async move {
+            let _ = serve_link(Link::handshake(server, &k, false).await?, src).await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let r = receive(vec![client], &key, d.join("out"), Options::default()).await;
+        assert!(r.unwrap_err().to_string().contains("unsafe path"));
+        assert!(!d.join("escaped.bin").exists());
+        assert!(!d.join("out").exists(), "nothing is created before the manifest is checked");
+    }
+
+    /// A receiver that asks for far more than it reads is cut off instead of being queued for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_greedy_receiver_is_cut_off() {
+        let d = tmp("greedy");
+        let src = Arc::new(source(&d));
+        let key = Key::from_secret("123456");
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let k = key.clone();
+        let serving = tokio::spawn(async move { serve_link(Link::handshake(server, &k, false).await?, src).await });
+        let mut l = Link::handshake(client, &key, true).await.unwrap();
+        l.send_msg(&Msg::Hello { want_manifest: false, hw_aes: false }).await.unwrap();
+        l.send_msg(&Msg::Request { ids: vec![0; MAX_PENDING + 1] }).await.unwrap();
+        assert!(serving.await.unwrap().is_err());
+    }
+
+    /// A manifest for a big transfer is several megabytes: it has to cross as one message, and a
+    /// control frame that claims more than it carries has to fail rather than be waited for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_manifest_crosses_and_a_forged_length_does_not() {
+        let key = Key::from_secret("123456");
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let k = key.clone();
+        let far = tokio::spawn(async move { Link::handshake(b, &k, false).await });
+        let (mut near, mut far) = (Link::handshake(a, &key, true).await.unwrap(), far.await.unwrap().unwrap());
+        let n = 100_000u32;
+        let m = Manifest {
+            session: [0; 16],
+            files: vec![],
+            chunks: (0..n).map(|i| Occ { file: 0, off: i as u64, len: 1, block: i }).collect(),
+            blocks: (0..n).map(|i| *blake3::hash(&i.to_be_bytes()).as_bytes()).collect(),
+            block_len: vec![1; n as usize],
+            total: 0,
+        };
+        let sent = m.clone();
+        let sending = tokio::spawn(async move {
+            far.send_msg(&Msg::Manifest(sent)).await.unwrap();
+            far
+        });
+        let Frame::Msg(Msg::Manifest(got)) = near.recv().await.unwrap() else { panic!("expected a manifest") };
+        assert_eq!((got.blocks, got.chunks.len()), (m.blocks, m.chunks.len()));
+
+        let mut far = sending.await.unwrap();
+        far.wr.write_all(&control_header(MAX_CONTROL as u32 + 1)).await.unwrap();
+        far.wr.flush().await.unwrap();
+        assert!(near.recv().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handshake_failures_all_look_the_same() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let right = Key::from_secret("482913");
+        let serving = tokio::spawn(async move { Link::handshake(b, &right, false).await.map(|_| ()) });
+        let wrong = Link::handshake(a, &Key::from_secret("482914"), true).await.map(|_| ());
+        assert!(wrong.unwrap_err().downcast_ref::<HandshakeFailed>().is_some());
+        assert!(serving.await.unwrap().unwrap_err().downcast_ref::<HandshakeFailed>().is_some());
+
+        // Garbage instead of a handshake.
+        let (mut a, b) = tokio::io::duplex(1 << 16);
+        let key = Key::from_secret("482913");
+        let serving = tokio::spawn(async move { Link::handshake(b, &key, false).await.map(|_| ()) });
+        a.write_all(&[0xff; 300]).await.unwrap();
+        assert!(serving.await.unwrap().unwrap_err().downcast_ref::<HandshakeFailed>().is_some());
+    }
+
+    /// The handshake carries nothing a recorded copy can be tested against: two runs with the
+    /// same secret share no bytes, so there is no fixed value for an offline guess to match.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_secret_never_keys_the_handshake_directly() {
+        let key = Key::from_secret("482913");
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (a, relay_a) = tokio::io::duplex(1 << 16);
+            let (relay_b, b) = tokio::io::duplex(1 << 16);
+            let (mut ar, mut aw) = tokio::io::split(relay_a);
+            let (mut br, mut bw) = tokio::io::split(relay_b);
+            let tap = Arc::new(Mutex::new(Vec::new()));
+            let t = tap.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = ar.read(&mut buf).await {
+                    if n == 0 || bw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    t.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut br, &mut aw).await;
+            });
+            let k = key.clone();
+            let serving = tokio::spawn(async move { Link::handshake(b, &k, false).await.map(|_| ()) });
+            Link::handshake(a, &key, true).await.unwrap();
+            serving.await.unwrap().unwrap();
+            seen.push(tap.lock().unwrap().clone());
+        }
+        assert!(seen[0].len() > 80 && seen[0].len() == seen[1].len());
+        let same = seen[0].iter().zip(&seen[1]).filter(|(x, y)| x == y).count();
+        assert!(same < seen[0].len() / 2, "{same} of {} handshake bytes repeated", seen[0].len());
+    }
 }

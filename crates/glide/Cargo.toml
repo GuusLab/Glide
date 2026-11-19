@@ -11,9 +11,11 @@ keywords = ["file-transfer", "p2p", "offline", "protocol", "multipath"]
 categories = ["network-programming", "filesystem"]
 
 [dependencies]
-glide-core = { path = "../glide-core", version = "0.3.0" }
+glide-core = { path = "../glide-core", version = "0.4.0" }
 tokio = { version = "1", features = ["io-util", "rt", "sync", "time", "macros"] }
 snow = "0.9"
+spake2 = "0.4"
+zeroize = "1"
 blake3 = "1"
 zstd = "0.13"
 fastcdc = "3"

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/GuusLab/Glide/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/GuusLab/Glide/ci.yml?branch=main&style=flat-square&label=tests&color=111"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-111?style=flat-square">
-  <img alt="Lines" src="https://img.shields.io/badge/code-~890_lines-111?style=flat-square">
+  <img alt="Lines" src="https://img.shields.io/badge/code-~1110_lines-111?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-111?style=flat-square">
 </p>
 
@@ -113,7 +113,7 @@ flowchart LR
     D -. "Request: next 32 blocks" .-> S
 ```
 
-1. **Handshake.** Noise `NNpsk0` per stream. The pre-shared key is derived from the code or PIN, so a wrong key fails before a single byte of data moves.
+1. **Handshake.** SPAKE2 on the code or PIN, then Noise `NNpsk0` keyed with the result, per stream. A wrong secret fails before a single byte of data moves, and a recorded handshake gives nothing to test guesses against: every guess costs a live connection, and the sender stops after 20.
 2. **Manifest.** The sender cuts every file with FastCDC and hashes each block with BLAKE3. Identical blocks get one ID. The manifest lists files, block positions and hashes.
 3. **Reuse.** The receiver looks for those blocks in what it already has: an older version of the file, or any folder you point it at. Matches are copied locally.
 4. **Pull.** Each stream keeps 32 blocks in flight. Blocks are sealed with AES-256-GCM when both sides have hardware AES, ChaCha20-Poly1305 otherwise.
@@ -183,7 +183,7 @@ MB=1024 scripts/bench.sh               # the full table above
 
 ## Status
 
-Glide is **v0.3, early, and not yet audited**. Do not rely on it to protect sensitive data yet, and see [SECURITY.md](SECURITY.md) to report a problem. The wire format may still change. All numbers above come from loopback and in-memory streams; the radio bindings (Wi-Fi Aware on iOS 26 and Android, Multipeer, Wi-Fi Direct) are next.
+Glide is **v0.4, early, and not yet audited**. Do not rely on it to protect sensitive data yet, and see [SECURITY.md](SECURITY.md) to report a problem. The wire format may still change. All numbers above come from loopback and in-memory streams; the radio bindings (Wi-Fi Aware on iOS 26 and Android, Multipeer, Wi-Fi Direct) are next.
 
 **Roadmap**
 

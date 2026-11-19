@@ -167,3 +167,40 @@ async fn wrong_key_is_refused() {
     let st = streams(&s, &Key::from_secret("right"), &[None]);
     assert!(receive(st, &Key::from_secret("wrong"), d.join("out"), Options::default()).await.is_err());
 }
+
+/// The resume state says a block is there; the file says otherwise. The file wins.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_does_not_trust_its_own_state_file() {
+    let d = tmp("resume-damaged");
+    write(&d.join("src/big.bin"), &noise(16_000_000, 9));
+    let key = Key::from_secret("k");
+    let s = Sender::new(d.join("src")).unwrap();
+    let first = receive(streams(&s, &key, &[Some(6_000_000)]), &key, d.join("out"), Options::default()).await;
+    assert!(first.is_err());
+    // Everything received so far is wiped from the file, while the state still claims it.
+    std::fs::write(d.join("out/big.bin"), vec![0u8; 16_000_000]).unwrap();
+    let r = receive(streams(&s, &key, &[None]), &key, d.join("out"), Options::default()).await.unwrap();
+    same_tree(&d.join("src"), &d.join("out"));
+    assert_eq!(r.received, 16_000_000, "every block was fetched again");
+}
+
+/// Same layout, different content: the second transfer must not inherit the first one's state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_file_does_not_resume_the_old_one() {
+    let d = tmp("resume-changed");
+    let v1 = noise(16_000_000, 10);
+    write(&d.join("src/big.bin"), &v1);
+    let key = Key::from_secret("k");
+    let s = Sender::new(d.join("src")).unwrap();
+    assert!(receive(streams(&s, &key, &[Some(6_000_000)]), &key, d.join("out"), Options::default()).await.is_err());
+    // Flip one byte per megabyte: the cut points stay where they were, the content does not.
+    let mut v2 = v1.clone();
+    for i in (500_000..v2.len()).step_by(1_000_000) {
+        v2[i] ^= 0xff;
+    }
+    write(&d.join("src/big.bin"), &v2);
+    let s2 = Sender::new(d.join("src")).unwrap();
+    assert_ne!(s.manifest().session, s2.manifest().session);
+    receive(streams(&s2, &key, &[None]), &key, d.join("out"), Options::default()).await.unwrap();
+    same_tree(&d.join("src"), &d.join("out"));
+}
