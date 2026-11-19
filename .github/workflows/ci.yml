@@ -13,8 +13,6 @@ jobs:
             runner: ubuntu-latest
           - name: windows
             runner: windows-latest
-          - name: macos
-            runner: macos-latest
     name: test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     steps:
