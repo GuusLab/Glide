@@ -197,4 +197,4 @@ Built by [GuusLab](https://guuslab.com) for [Nemi](https://nemilab.com).
 
 ## License
 
-MIT or Apache-2.0, at your option.
+Copyright 2026 GuusLab. Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
