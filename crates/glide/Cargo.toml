@@ -13,13 +13,13 @@ categories = ["network-programming", "filesystem"]
 [dependencies]
 glide-core = { path = "../glide-core", version = "0.3.0" }
 tokio = { version = "1", features = ["io-util", "rt", "sync", "time", "macros"] }
-snow = "0.9"
+snow = "0.10"
 blake3 = "1"
-zstd = "0.13"
-fastcdc = "3"
+zstd = "0.14"
+fastcdc = "5"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+bincode = "3"
 anyhow = "1"
 
 [dev-dependencies]

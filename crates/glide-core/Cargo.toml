@@ -9,5 +9,5 @@ authors.workspace = true
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
