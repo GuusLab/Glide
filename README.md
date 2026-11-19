@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/GuusLab/glide/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/GuusLab/glide/ci.yml?branch=main&style=flat-square&label=tests&color=111"></a>
+  <a href="https://github.com/GuusLab/Glide/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/GuusLab/Glide/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-111?style=flat-square">
   <img alt="Lines" src="https://img.shields.io/badge/code-~890_lines-111?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-111?style=flat-square">
