@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/GuusLab/Glide/actions/workflows/ci.yml"><img alt="Tested on" src="https://img.shields.io/badge/tested_on-linux_%C2%B7_macos_%C2%B7_windows_%C2%B7_wasm-111?style=flat-square"></a>
+  <a href="https://github.com/GuusLab/Glide/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/GuusLab/Glide/ci.yml?branch=main&style=flat-square&label=tests&color=111"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-stable-111?style=flat-square">
   <img alt="Lines" src="https://img.shields.io/badge/code-~890_lines-111?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-111?style=flat-square">
@@ -183,7 +183,7 @@ MB=1024 scripts/bench.sh               # the full table above
 
 ## Status
 
-Glide is **v0.3, early, and not yet audited**. The wire format may still change. All numbers above come from loopback and in-memory streams; the radio bindings (Wi-Fi Aware on iOS 26 and Android, Multipeer, Wi-Fi Direct) are next.
+Glide is **v0.3, early, and not yet audited**. Do not rely on it to protect sensitive data yet, and see [SECURITY.md](SECURITY.md) to report a problem. The wire format may still change. All numbers above come from loopback and in-memory streams; the radio bindings (Wi-Fi Aware on iOS 26 and Android, Multipeer, Wi-Fi Direct) are next.
 
 **Roadmap**
 
