@@ -27,16 +27,6 @@ jobs:
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
       - run: cargo run --release -p glide-cli -- bench
-  # GuusLab's own Mac runs only for pushes to main in this repo, never for pull requests,
-  # so code from outside contributors never runs on our hardware.
-  test-own-mac:
-    if: github.event_name == 'push' && github.repository == 'GuusLab/Glide'
-    runs-on: [self-hosted, macOS]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release
-      - run: cargo run --release -p glide-cli -- bench
   wasm:
     runs-on: ubuntu-latest
     steps:
