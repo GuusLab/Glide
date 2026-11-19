@@ -1205,8 +1205,12 @@ mod tests {
             assert!(safe_path(bad).is_err(), "{bad:?} should be refused");
         }
         assert!(safe_path(&"a/".repeat(3000)).is_err());
-        for good in ["a", "a/b/c.txt", ".hidden", "a..b", "...", "name with spaces.txt", "ünï/cødé"] {
+        for good in ["a", "a/b/c.txt", ".hidden", "a..b", "name with spaces.txt", "ünï/cødé"] {
             assert_eq!(safe_path(good).unwrap(), PathBuf::from(good));
+        }
+        // Legal names elsewhere, but Windows cannot hold them or reads them as something else.
+        for windows_only in ["...", "trailing.", "trailing ", "NUL", "com1.txt", "a:b", "what?"] {
+            assert_eq!(safe_path(windows_only).is_err(), cfg!(windows), "{windows_only:?}");
         }
     }
 
