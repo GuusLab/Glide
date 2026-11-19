@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 200" width="540" height="200" role="img" aria-label="Glide">
+  <svg x="0" y="28" width="232" height="144" viewBox="24 56 232 144">
+  <defs>
+    <linearGradient id="gw" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="216" y2="0"><stop offset="0" stop-color="#FF4A12" stop-opacity="0.02"/><stop offset="1" stop-color="#FF4A12" stop-opacity="0.30"/></linearGradient>
+    <linearGradient id="gs" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="216" y2="0"><stop offset="0" stop-color="#FF4A12" stop-opacity="0.12"/><stop offset="0.55" stop-color="#FF5A1C"/><stop offset="1" stop-color="#FFC890"/></linearGradient>
+    <radialGradient id="gt" gradientUnits="userSpaceOnUse" cx="214" cy="128" r="34"><stop offset="0" stop-color="#FFE7CC"/><stop offset="0.3" stop-color="#FF6A2A" stop-opacity="0.6"/><stop offset="1" stop-color="#FF4A12" stop-opacity="0"/></radialGradient>
+  </defs>
+  <path d="M40 76 C 120 86, 170 110, 214 128 C 170 146, 120 170, 40 180 C 86 158, 112 142, 124 128 C 112 114, 86 98, 40 76 Z" fill="url(#gw)"/>
+  <g fill="none" stroke="url(#gs)" stroke-linecap="round">
+    <path d="M40 76 C 120 86, 170 110, 214 128" stroke-width="13"/>
+    <path d="M40 180 C 120 170, 170 146, 214 128" stroke-width="13"/>
+    <path d="M100 128 L 214 128" stroke-width="9"/>
+  </g>
+  <circle cx="214" cy="128" r="34" fill="url(#gt)"/>
+  <circle cx="214" cy="128" r="8" fill="#FFF4E8"/>
+
+  </svg>
+  <g transform="translate(258 45.4) scale(0.78) skewX(-10)"><defs><radialGradient id="lwg"><stop offset="0" stop-color="#FF7A3D" stop-opacity=".9"/><stop offset="1" stop-color="#FF4D1A" stop-opacity="0"/></radialGradient></defs><g fill="none" stroke="#F5F5F7" stroke-width="13" stroke-linejoin="miter"><path d="M4,132 H52 Q72,132 72,112 V48 Q72,40 64,40 H20 Q0,40 0,60 V80 Q0,100 20,100 H72"/><path d="M104,0 V100"/><path d="M136,40 V100"/><path d="M240,0 V92 Q240,100 232,100 H188 Q168,100 168,80 V60 Q168,40 188,40 H240"/><path d="M272,70 H344 V60 Q344,40 324,40 H292 Q272,40 272,60 V80 Q272,100 292,100 H340"/></g><circle cx="136" cy="14" r="22" fill="url(#lwg)"/><circle cx="136" cy="14" r="7" fill="#FFF3E8"/></g>
+</svg>

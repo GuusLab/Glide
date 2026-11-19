@@ -1,0 +1,26 @@
+[package]
+name = "glide"
+description = "Glide: a fast, transport-agnostic file transfer protocol. Any stream, many at once, no internet."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["file-transfer", "p2p", "offline", "protocol", "multipath"]
+categories = ["network-programming", "filesystem"]
+
+[dependencies]
+glide-core = { path = "../glide-core", version = "0.3.0" }
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time", "macros"] }
+snow = "0.9"
+blake3 = "1"
+zstd = "0.13"
+fastcdc = "3"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

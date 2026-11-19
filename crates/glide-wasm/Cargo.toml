@@ -1,0 +1,21 @@
+[package]
+name = "glide-wasm"
+description = "The Glide core compiled to WebAssembly (plain C ABI, no imports)"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+glide-core = { path = "../glide-core" }
+blake3 = { version = "1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

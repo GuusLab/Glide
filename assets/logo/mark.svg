@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="24 56 232 144" width="232" height="144" role="img" aria-label="Glide">
+  <defs>
+    <linearGradient id="gw" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="216" y2="0"><stop offset="0" stop-color="#FF4A12" stop-opacity="0.02"/><stop offset="1" stop-color="#FF4A12" stop-opacity="0.30"/></linearGradient>
+    <linearGradient id="gs" gradientUnits="userSpaceOnUse" x1="40" y1="0" x2="216" y2="0"><stop offset="0" stop-color="#FF4A12" stop-opacity="0.12"/><stop offset="0.55" stop-color="#FF5A1C"/><stop offset="1" stop-color="#FFC890"/></linearGradient>
+    <radialGradient id="gt" gradientUnits="userSpaceOnUse" cx="214" cy="128" r="34"><stop offset="0" stop-color="#FFE7CC"/><stop offset="0.3" stop-color="#FF6A2A" stop-opacity="0.6"/><stop offset="1" stop-color="#FF4A12" stop-opacity="0"/></radialGradient>
+  </defs>
+  <path d="M40 76 C 120 86, 170 110, 214 128 C 170 146, 120 170, 40 180 C 86 158, 112 142, 124 128 C 112 114, 86 98, 40 76 Z" fill="url(#gw)"/>
+  <g fill="none" stroke="url(#gs)" stroke-linecap="round">
+    <path d="M40 76 C 120 86, 170 110, 214 128" stroke-width="13"/>
+    <path d="M40 180 C 120 170, 170 146, 214 128" stroke-width="13"/>
+    <path d="M100 128 L 214 128" stroke-width="9"/>
+  </g>
+  <circle cx="214" cy="128" r="34" fill="url(#gt)"/>
+  <circle cx="214" cy="128" r="8" fill="#FFF4E8"/>
+</svg>

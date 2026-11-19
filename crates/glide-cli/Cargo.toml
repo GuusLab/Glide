@@ -1,0 +1,20 @@
+[package]
+name = "glide-cli"
+description = "Command line sender and receiver for the Glide protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "glide"
+path = "src/main.rs"
+
+[dependencies]
+glide = { path = "../glide", version = "0.3.0" }
+glide-core = { path = "../glide-core", version = "0.3.0" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+rayon = "1"
+blake3 = "1"
