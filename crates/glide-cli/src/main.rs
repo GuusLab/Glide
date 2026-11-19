@@ -126,9 +126,9 @@ async fn main() -> Result<()> {
                     }
                 }));
             }
-            for h in handles {
-                h.await?;
-            }
+            // Listeners run until the process is stopped.
+            let _listeners = handles;
+            std::future::pending::<()>().await;
         }
         Some("recv") => {
             let key = Key::from_secret(&arg(&args, "--key").unwrap_or_default());
